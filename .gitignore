@@ -1,2 +1,8 @@
 myenv/
-.env/
+.env
+.env.*
+__pycache__/
+*.pyc
+*.pyo
+ssvps_gemini_index/
+.streamlit/secrets.toml

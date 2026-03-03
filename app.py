@@ -1,55 +1,102 @@
-# ------------------------------------------------------------------------------------
-# 0️⃣ Install requirements:
-# pip install streamlit langchain langchain-google-genai pypdf faiss-cpu python-dotenv
-# 
-# Place this script in the same folder as: ssvps_college_dataset_unicode.pdf
-# ------------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# SSVPS College Knowledge Assistant – Production-Ready Streamlit Chatbot
+# ---------------------------------------------------------------------------
 
+import logging
 import os
+import shutil
+
 import streamlit as st
 from dotenv import load_dotenv
-
+from langchain_classic.chains import ConversationalRetrievalChain
+from langchain_classic.memory import ConversationBufferWindowMemory
 from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain.chains import RetrievalQA
+from langchain_core.prompts import (
+    ChatPromptTemplate,
+    HumanMessagePromptTemplate,
+    SystemMessagePromptTemplate,
+)
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# CONFIGURATION
-PDF_FILE = "ssvps_college_dataset_unicode.pdf"  # Your specific PDF
-INDEX_DIR = "ssvps_gemini_index"                # Where to save/load index
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
-# Page config
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+PDF_FILE = "ssvps_college_dataset_unicode.pdf"
+INDEX_DIR = "ssvps_gemini_index"
+MAX_INPUT_LENGTH = 1000
+
+SUGGESTED_QUESTIONS = [
+    "What courses are offered at SSVPS College?",
+    "What is the fee structure for B.Tech?",
+    "Tell me about the placement record",
+    "What are the eligibility criteria for admission?",
+    "Describe the college library facilities",
+    "What sports facilities are available?",
+]
+
+SYSTEM_PROMPT = """You are the official AI assistant for SSVPS's Bapusaheb Shivajirao \
+Deore College of Engineering, Dhule, Maharashtra. You provide accurate, helpful, and \
+friendly answers about the college based **only** on the retrieved context below.
+
+Guidelines:
+- Answer in clear, well-structured sentences. Use bullet points or numbered lists when \
+listing multiple items (courses, departments, fees, etc.).
+- If the context does not contain enough information to fully answer the question, say \
+so honestly and suggest the user contact the college office.
+- When discussing fees, intake numbers, or eligibility, always mention the relevant \
+academic year if available in the context.
+- Be polite and professional; address the user respectfully.
+- Do NOT fabricate information that is not present in the context.
+
+Context:
+{context}"""
+
+HUMAN_PROMPT = "{question}"
+
+# ---------------------------------------------------------------------------
+# Page config & CSS
+# ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="SSVPS College RAG",
+    page_title="SSVPS College Assistant",
     page_icon="🎓",
-    layout="wide"
+    layout="wide",
 )
 
-# Custom CSS
-st.markdown("""
+st.markdown(
+    """
 <style>
-    .main-header { 
+    .main-header {
         background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
         font-size: 2.5rem !important;
         font-weight: 800;
     }
-    .stChatMessage { 
-        padding: 1rem; 
-        border-radius: 1rem; 
+    .stChatMessage {
+        padding: 1rem;
+        border-radius: 1rem;
         margin-bottom: 1rem;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        box-shadow: 0 2px 8px rgba(0,0,0,0.08);
     }
-    .source-box { 
-        background: #f8f9fa; 
-        padding: 0.75rem; 
-        border-radius: 0.5rem; 
+    .source-box {
+        background: #f8f9fa;
+        padding: 0.75rem;
+        border-radius: 0.5rem;
         border-left: 4px solid #667eea;
         margin: 0.5rem 0;
         font-size: 0.85rem;
         color: #555;
+    }
+    .suggestion-btn button {
+        width: 100%;
     }
     .status-badge {
         display: inline-block;
@@ -62,224 +109,290 @@ st.markdown("""
     .status-loading { background: #fff3cd; color: #856404; }
     .status-error { background: #f8d7da; color: #721c24; }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
+
+# ---------------------------------------------------------------------------
+# RAG helpers
+# ---------------------------------------------------------------------------
+
 
 @st.cache_resource(show_spinner=False)
-def initialize_rag_system(api_key):
-    """Initialize or load existing RAG system"""
-    
-    # Setup embeddings
+def build_vectorstore(api_key: str):
+    """Build or load the FAISS vectorstore from the PDF dataset."""
     embeddings = GoogleGenerativeAIEmbeddings(
         model="models/text-embedding-004",
-        google_api_key=api_key
+        google_api_key=api_key,
     )
-    
-    # Check if index exists
+
     if os.path.exists(INDEX_DIR):
-        st.info("📂 Loading existing knowledge base...")
-        vectorstore = FAISS.load_local(
-            INDEX_DIR, 
-            embeddings, 
-            allow_dangerous_deserialization=True
+        logger.info("Loading existing FAISS index from %s", INDEX_DIR)
+        return FAISS.load_local(
+            INDEX_DIR,
+            embeddings,
+            allow_dangerous_deserialization=True,
         )
-        return vectorstore
-    
-    # Create new index from PDF
+
     if not os.path.exists(PDF_FILE):
         raise FileNotFoundError(f"PDF not found: {PDF_FILE}")
-    
-    st.info("🔨 Building knowledge base from PDF... (one-time setup)")
-    
-    # Load and process PDF
+
+    logger.info("Building FAISS index from %s …", PDF_FILE)
     loader = PyPDFLoader(PDF_FILE)
     pages = loader.load()
-    
-    # Split into chunks
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=800,
-        chunk_overlap=100
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1200,
+        chunk_overlap=200,
+        separators=["\n\n", "\n", ". ", " ", ""],
     )
-    chunks = text_splitter.split_documents(pages)
-    
-    # Create vector store
+    chunks = splitter.split_documents(pages)
+
     vectorstore = FAISS.from_documents(chunks, embeddings)
     vectorstore.save_local(INDEX_DIR)
-    
-    st.success(f"✅ Indexed {len(pages)} pages into {len(chunks)} chunks!")
+    logger.info("Indexed %d pages → %d chunks", len(pages), len(chunks))
     return vectorstore
 
-def get_qa_chain(vectorstore, api_key):
-    """Create QA chain"""
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
-    
+
+def get_qa_chain(vectorstore, api_key: str):
+    """Create a conversational retrieval chain with memory."""
+    retriever = vectorstore.as_retriever(
+        search_type="mmr",
+        search_kwargs={"k": 5, "fetch_k": 10},
+    )
+
     llm = ChatGoogleGenerativeAI(
         model="gemini-2.0-flash",
         google_api_key=api_key,
-        temperature=0.2
-    )
-    
-    return RetrievalQA.from_chain_type(
-        llm=llm,
-        retriever=retriever,
-        return_source_documents=True
+        temperature=0.3,
     )
 
-# Initialize session state
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            SystemMessagePromptTemplate.from_template(SYSTEM_PROMPT),
+            HumanMessagePromptTemplate.from_template(HUMAN_PROMPT),
+        ]
+    )
+
+    memory = ConversationBufferWindowMemory(
+        memory_key="chat_history",
+        return_messages=True,
+        output_key="answer",
+        k=6,
+    )
+
+    chain = ConversationalRetrievalChain.from_llm(
+        llm=llm,
+        retriever=retriever,
+        memory=memory,
+        combine_docs_chain_kwargs={"prompt": prompt},
+        return_source_documents=True,
+    )
+    return chain
+
+
+# ---------------------------------------------------------------------------
+# Session state
+# ---------------------------------------------------------------------------
 if "messages" not in st.session_state:
     st.session_state.messages = []
-if "vectorstore" not in st.session_state:
-    st.session_state.vectorstore = None
 if "qa_chain" not in st.session_state:
     st.session_state.qa_chain = None
 
-# Load environment variables
+# ---------------------------------------------------------------------------
+# Load .env
+# ---------------------------------------------------------------------------
 load_dotenv()
 env_api_key = os.getenv("GOOGLE_API_KEY")
 
+# ---------------------------------------------------------------------------
 # Sidebar
+# ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("⚙️ Settings")
-    
-    # API Key handling
+
     api_key = st.text_input(
         "Google API Key",
         type="password",
-        value=env_api_key if env_api_key else "",
-        help="Leave empty if set in .env file"
+        value=env_api_key or "",
+        help="Enter your Gemini API key or set GOOGLE_API_KEY in a .env file",
     )
-    
     final_api_key = api_key or env_api_key
-    
+
     st.divider()
-    
-    # System status
     st.subheader("📊 System Status")
-    
+
     if not final_api_key:
-        st.markdown('<span class="status-badge status-error">🔴 API Key Missing</span>', unsafe_allow_html=True)
+        st.markdown(
+            '<span class="status-badge status-error">🔴 API Key Missing</span>',
+            unsafe_allow_html=True,
+        )
     elif st.session_state.qa_chain:
-        st.markdown('<span class="status-badge status-ready">🟢 Ready</span>', unsafe_allow_html=True)
-        st.caption(f"📄 Using: `{PDF_FILE}`")
+        st.markdown(
+            '<span class="status-badge status-ready">🟢 Ready</span>',
+            unsafe_allow_html=True,
+        )
+        st.caption(f"📄 Dataset: `{PDF_FILE}`")
         if os.path.exists(INDEX_DIR):
-            st.caption(f"💾 Index cached locally")
+            st.caption("💾 Index cached locally")
     else:
-        st.markdown('<span class="status-badge status-loading">🟡 Initializing...</span>', unsafe_allow_html=True)
-    
+        st.markdown(
+            '<span class="status-badge status-loading">🟡 Initializing…</span>',
+            unsafe_allow_html=True,
+        )
+
     st.divider()
-    
-    # Management options
+
     col1, col2 = st.columns(2)
-    
     with col1:
         if st.button("🗑️ Clear Chat", use_container_width=True):
             st.session_state.messages = []
+            st.session_state.qa_chain = None  # reset memory
             st.rerun()
-    
     with col2:
         if st.button("🔄 Rebuild Index", use_container_width=True):
             if os.path.exists(INDEX_DIR):
-                import shutil
                 shutil.rmtree(INDEX_DIR)
-                st.session_state.vectorstore = None
-                st.session_state.qa_chain = None
-                st.success("Index cleared! Reload to rebuild.")
-                st.rerun()
-    
+            st.session_state.qa_chain = None
+            build_vectorstore.clear()
+            st.rerun()
+
     st.divider()
-    st.caption("💡 Tip: Index auto-saves after first run")
+    st.caption("💡 Index auto-saves after the first run and loads instantly on restart.")
 
-# Main UI
-st.markdown("<h1 class='main-header'>🎓 SSVPS College Knowledge Assistant</h1>", unsafe_allow_html=True)
-st.caption("Powered by Gemini 2.0 • RAG-Enabled Document Q&A")
+# ---------------------------------------------------------------------------
+# Header
+# ---------------------------------------------------------------------------
+st.markdown(
+    "<h1 class='main-header'>🎓 SSVPS College Knowledge Assistant</h1>",
+    unsafe_allow_html=True,
+)
+st.caption("Powered by Gemini 2.0 Flash • RAG-Enabled Document Q&A • Conversation-Aware")
 
-# Initialize RAG system automatically
+# ---------------------------------------------------------------------------
+# Initialize RAG system
+# ---------------------------------------------------------------------------
 if final_api_key and not st.session_state.qa_chain:
     try:
-        with st.spinner("⚡ Initializing knowledge base..."):
-            vectorstore = initialize_rag_system(final_api_key)
-            st.session_state.vectorstore = vectorstore
+        with st.spinner("⚡ Initializing knowledge base…"):
+            vectorstore = build_vectorstore(final_api_key)
             st.session_state.qa_chain = get_qa_chain(vectorstore, final_api_key)
             st.rerun()
-    except Exception as e:
-        st.error(f"❌ Initialization failed: {str(e)}")
+    except FileNotFoundError as exc:
+        st.error(f"❌ {exc}")
+        st.stop()
+    except Exception as exc:
+        logger.exception("Initialization failed")
+        st.error(f"❌ Initialization failed: {exc}")
         st.stop()
 
-# Show chat interface only when ready
-if st.session_state.qa_chain:
-    # Chat history
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"], avatar="🧑‍🎓" if message["role"] == "user" else "🤖"):
-            st.markdown(message["content"])
-            
-            if message["role"] == "assistant" and "sources" in message:
-                with st.expander("📎 Sources", expanded=False):
-                    for i, src in enumerate(message["sources"], 1):
-                        st.markdown(f"""
-                        <div class="source-box">
-                            <b>Source {i}</b> • {src['meta']}<br>
-                            <i>{src['text'][:250]}...</i>
-                        </div>
-                        """, unsafe_allow_html=True)
 
-    # Input
-    if prompt := st.chat_input("Ask about SSVPS College..."):
-        # Add user message
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        
-        with st.chat_message("user", avatar="🧑‍🎓"):
-            st.markdown(prompt)
-        
-        # Generate response
-        with st.chat_message("assistant", avatar="🤖"):
-            with st.spinner("🧠 Retrieving information..."):
-                try:
-                    result = st.session_state.qa_chain({"query": prompt})
-                    answer = result["result"]
-                    sources = result["source_documents"]
-                    
-                    st.markdown(answer)
-                    
-                    # Process sources
-                    source_data = []
-                    with st.expander("📎 Sources", expanded=False):
-                        for i, doc in enumerate(sources, 1):
-                            src = {
-                                "meta": doc.metadata.get("source", "PDF"),
-                                "text": doc.page_content
-                            }
-                            source_data.append(src)
-                            st.markdown(f"""
-                            <div class="source-box">
-                                <b>Source {i}</b> • {doc.metadata.get("source", "PDF")}<br>
-                                <i>{doc.page_content[:250]}...</i>
-                            </div>
-                            """, unsafe_allow_html=True)
-                    
-                    # Save to history
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": answer,
-                        "sources": source_data
-                    })
-                    
-                except Exception as e:
-                    st.error(f"Error: {str(e)}")
+# ---------------------------------------------------------------------------
+# Helper: handle a user query
+# ---------------------------------------------------------------------------
+def _handle_query(user_query: str):
+    """Send *user_query* to the QA chain and render the response."""
+    if len(user_query) > MAX_INPUT_LENGTH:
+        st.warning(
+            f"⚠️ Your question is too long ({len(user_query)} chars). "
+            f"Please keep it under {MAX_INPUT_LENGTH} characters."
+        )
+        return
+
+    st.session_state.messages.append({"role": "user", "content": user_query})
+
+    with st.chat_message("user", avatar="🧑‍🎓"):
+        st.markdown(user_query)
+
+    with st.chat_message("assistant", avatar="🤖"):
+        with st.spinner("🧠 Retrieving information…"):
+            try:
+                result = st.session_state.qa_chain({"question": user_query})
+                answer = result["answer"]
+                sources = result.get("source_documents", [])
+            except Exception as exc:
+                logger.exception("Query failed")
+                st.error(f"Something went wrong: {exc}")
+                return
+
+            st.markdown(answer)
+
+            if sources:
+                source_data = []
+                with st.expander("📎 Sources", expanded=False):
+                    for i, doc in enumerate(sources, 1):
+                        page_num = doc.metadata.get("page", "–")
+                        preview = doc.page_content[:300].replace("\n", " ")
+                        src = {
+                            "meta": f"Page {page_num}",
+                            "text": doc.page_content,
+                        }
+                        source_data.append(src)
+                        st.markdown(
+                            f'<div class="source-box">'
+                            f"<b>Source {i}</b> • Page {page_num}<br>"
+                            f"<i>{preview}…</i></div>",
+                            unsafe_allow_html=True,
+                        )
+
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": answer, "sources": source_data}
+                )
+            else:
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": answer}
+                )
+
+
+# ---------------------------------------------------------------------------
+# Chat UI
+# ---------------------------------------------------------------------------
+if st.session_state.qa_chain:
+    # Render history
+    for msg in st.session_state.messages:
+        avatar = "🧑‍🎓" if msg["role"] == "user" else "🤖"
+        with st.chat_message(msg["role"], avatar=avatar):
+            st.markdown(msg["content"])
+            if msg["role"] == "assistant" and "sources" in msg:
+                with st.expander("📎 Sources", expanded=False):
+                    for i, src in enumerate(msg["sources"], 1):
+                        preview = src["text"][:300].replace("\n", " ")
+                        st.markdown(
+                            f'<div class="source-box">'
+                            f"<b>Source {i}</b> • {src['meta']}<br>"
+                            f"<i>{preview}…</i></div>",
+                            unsafe_allow_html=True,
+                        )
+
+    # Suggested questions (shown only when chat is empty)
+    if not st.session_state.messages:
+        st.markdown("#### 💡 Try asking:")
+        cols = st.columns(2)
+        for idx, question in enumerate(SUGGESTED_QUESTIONS):
+            with cols[idx % 2]:
+                if st.button(question, key=f"sq_{idx}", use_container_width=True):
+                    _handle_query(question)
+                    st.rerun()
+
+    # Chat input
+    if prompt := st.chat_input("Ask anything about SSVPS College…"):
+        _handle_query(prompt)
+        st.rerun()
 
 else:
-    # Not ready state
-    st.info("""
-    ### 🚀 Getting Started
-    
-    1. **Set your Google API Key**:
-       - Enter in sidebar, OR
-       - Create `.env` file with: `GOOGLE_API_KEY=your_key_here`
-    
-    2. **Ensure PDF exists**: `{PDF_FILE}` in same folder
-    
-    3. **First run**: System will auto-index the PDF (saved to `{INDEX_DIR}/`)
-    
-    4. **Subsequent runs**: Loads instantly from cache!
-    """)
-    
+    # Not-ready state
+    st.info(
+        f"""
+### 🚀 Getting Started
+
+1. **Set your Google API Key** — enter it in the sidebar or create a `.env` file:
+   ```
+   GOOGLE_API_KEY=your_key_here
+   ```
+2. **Ensure the PDF dataset exists** — `{PDF_FILE}` must be in the project folder.
+3. **First run** — the system will automatically index the PDF (saved to `{INDEX_DIR}/`).
+4. **Subsequent runs** — the index loads instantly from cache!
+"""
+    )
     if not os.path.exists(PDF_FILE):
         st.error(f"⚠️ PDF file not found: `{PDF_FILE}`")
