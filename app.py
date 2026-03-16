@@ -17,7 +17,8 @@ from langchain_core.prompts import (
     HumanMessagePromptTemplate,
     SystemMessagePromptTemplate,
 )
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # ---------------------------------------------------------------------------
@@ -29,7 +30,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-PDF_FILE = "ssvps_college_dataset_unicode.pdf"
+PDF_FILE = "ssvps_college_dataset_cleaned.pdf"
 INDEX_DIR = "ssvps_gemini_index"
 MAX_INPUT_LENGTH = 1000
 
@@ -121,11 +122,9 @@ st.markdown(
 @st.cache_resource(show_spinner=False)
 def build_vectorstore(api_key: str):
     """Build or load the FAISS vectorstore from the PDF dataset."""
-    embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/text-embedding-004",
-        google_api_key=api_key,
-    )
-
+    embeddings = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
     if os.path.exists(INDEX_DIR):
         logger.info("Loading existing FAISS index from %s", INDEX_DIR)
         return FAISS.load_local(
@@ -158,11 +157,11 @@ def get_qa_chain(vectorstore, api_key: str):
     """Create a conversational retrieval chain with memory."""
     retriever = vectorstore.as_retriever(
         search_type="mmr",
-        search_kwargs={"k": 5, "fetch_k": 10},
+        search_kwargs={"k": 5, "fetch_k": 20},
     )
 
     llm = ChatGoogleGenerativeAI(
-        model="gemini-2.0-flash",
+        model="gemini-2.5-flash",
         google_api_key=api_key,
         temperature=0.3,
     )
